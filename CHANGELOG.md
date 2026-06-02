@@ -1,13 +1,23 @@
+## 1.0.3
+
+* **Fix blank Windows terminal (regression from 1.0.2)** — 1.0.2 dropped the
+  `STARTF_USESTDHANDLES` setup, which made the child process inherit the host's
+  real console (or none) instead of attaching to the pseudoconsole. Shells like
+  `cmd`, PowerShell and bash then produced no output and accepted no input — the
+  terminal view stayed black. The child's inherited std handles are cleared
+  again (verified against `cmd` both under `flutter run` and as a built app), so
+  console programs route all I/O through the ConPTY as before.
+* **Proper ConPTY handle cleanup** — the parent now closes its copies of the
+  pipe ends duplicated into conhost (`inputReadSide` / `outputWriteSide`), frees
+  the proc-thread attribute list (`DeleteProcThreadAttributeList`) and closes the
+  process's thread handle. Without closing `outputWriteSide` the read loop never
+  saw EOF on child exit.
+
 ## 1.0.2
 
-* **Windows ConPTY stdin fix** — the native Windows backend no longer sets
-  `STARTF_USESTDHANDLES` with NULL handles when launching the child process.
-  With a pseudoconsole (`PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`) the ConPTY itself
-  provides the child's stdin/stdout/stderr; forcing NULL std handles conflicted
-  with it and corrupted stdin. CLIs launched directly as the ConPTY root (e.g.
-  `claude`) could see their own name injected into stdin right after start. The
-  startup info now only sets `cb` + the pseudoconsole attribute, matching the
-  official Microsoft sample.
+* **Windows ConPTY stdin change (superseded by 1.0.3)** — stopped setting
+  `STARTF_USESTDHANDLES` with NULL handles. This regressed plain shells (blank
+  terminal) and is reverted in 1.0.3; avoid 1.0.2 on Windows.
 
 ## 1.0.1
 

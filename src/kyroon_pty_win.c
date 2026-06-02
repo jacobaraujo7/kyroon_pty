@@ -322,14 +322,18 @@ FFI_PLUGIN_EXPORT PtyHandle *pty_create(PtyOptions *options)
     ZeroMemory(&startupInfo, sizeof(startupInfo));
     startupInfo.StartupInfo.cb = sizeof(startupInfo);
 
-    // IMPORTANTE: com um pseudoconsole (PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE) NÃO
-    // se deve usar STARTF_USESTDHANDLES — o próprio pseudoconsole provê os
-    // handles de stdin/stdout/stderr do filho. Setar STARTF_USESTDHANDLES com
-    // handles NULL (como era feito aqui) entra em conflito com o pseudoconsole e
-    // corrompe o stdin do processo: CLIs lançados DIRETO como raiz do ConPTY
-    // (ex.: claude) recebiam o próprio nome injetado no stdin logo após o start.
-    // O sample oficial da Microsoft e o ConPtyBridge do Worker apenas setam `cb`
-    // + o atributo PSEUDOCONSOLE, sem mexer em dwFlags/handles. Ver doc 00057.
+    // Clear the child's inherited std handles (STARTF_USESTDHANDLES with NULL).
+    // This forces console-mode programs (cmd, powershell, bash, vim, …) to
+    // attach to the pseudoconsole and route ALL their I/O through it — including
+    // when this host process itself owns a console (e.g. launched from a
+    // terminal or `flutter run`). Without it the child inherits the host's real
+    // console instead of the ConPTY, so its output never reaches our pipe and
+    // the terminal view stays blank. (Programs that write via the raw stdout
+    // FILE handle rather than the console API still need their own handling.)
+    startupInfo.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startupInfo.StartupInfo.hStdInput = NULL;
+    startupInfo.StartupInfo.hStdOutput = NULL;
+    startupInfo.StartupInfo.hStdError = NULL;
 
     SIZE_T bytesRequired;
     InitializeProcThreadAttributeList(NULL, 1, 0, &bytesRequired);
@@ -405,9 +409,18 @@ FFI_PLUGIN_EXPORT PtyHandle *pty_create(PtyOptions *options)
         return NULL;
     }
 
-    // free(startupInfo.lpAttributeList);
+    // CreatePseudoConsole duplicated inputReadSide / outputWriteSide into conhost,
+    // so the parent must release its own copies now. Keeping outputWriteSide open
+    // would prevent the read loop from ever seeing EOF when the child exits (the
+    // pipe still has a live writer — this host). Closing both leaves the ConPTY
+    // as the sole owner, which is what the Microsoft sample does.
+    CloseHandle(inputReadSide);
+    CloseHandle(outputWriteSide);
 
-    // CloseHandle(processInfo.hThread);
+    DeleteProcThreadAttributeList(startupInfo.lpAttributeList);
+    free(startupInfo.lpAttributeList);
+
+    CloseHandle(processInfo.hThread);
 
     HANDLE mutex = CreateSemaphore(
         NULL, // default security attributes
