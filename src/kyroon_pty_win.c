@@ -322,10 +322,14 @@ FFI_PLUGIN_EXPORT PtyHandle *pty_create(PtyOptions *options)
     ZeroMemory(&startupInfo, sizeof(startupInfo));
     startupInfo.StartupInfo.cb = sizeof(startupInfo);
 
-    startupInfo.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-    startupInfo.StartupInfo.hStdInput = NULL;
-    startupInfo.StartupInfo.hStdOutput = NULL;
-    startupInfo.StartupInfo.hStdError = NULL;
+    // IMPORTANTE: com um pseudoconsole (PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE) NÃO
+    // se deve usar STARTF_USESTDHANDLES — o próprio pseudoconsole provê os
+    // handles de stdin/stdout/stderr do filho. Setar STARTF_USESTDHANDLES com
+    // handles NULL (como era feito aqui) entra em conflito com o pseudoconsole e
+    // corrompe o stdin do processo: CLIs lançados DIRETO como raiz do ConPTY
+    // (ex.: claude) recebiam o próprio nome injetado no stdin logo após o start.
+    // O sample oficial da Microsoft e o ConPtyBridge do Worker apenas setam `cb`
+    // + o atributo PSEUDOCONSOLE, sem mexer em dwFlags/handles. Ver doc 00057.
 
     SIZE_T bytesRequired;
     InitializeProcThreadAttributeList(NULL, 1, 0, &bytesRequired);

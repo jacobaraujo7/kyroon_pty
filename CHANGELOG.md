@@ -1,3 +1,14 @@
+## 1.0.2
+
+* **Windows ConPTY stdin fix** — the native Windows backend no longer sets
+  `STARTF_USESTDHANDLES` with NULL handles when launching the child process.
+  With a pseudoconsole (`PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`) the ConPTY itself
+  provides the child's stdin/stdout/stderr; forcing NULL std handles conflicted
+  with it and corrupted stdin. CLIs launched directly as the ConPTY root (e.g.
+  `claude`) could see their own name injected into stdin right after start. The
+  startup info now only sets `cb` + the pseudoconsole attribute, matching the
+  official Microsoft sample.
+
 ## 1.0.1
 
 Example app improvements (the plugin API in `lib/` is unchanged):
