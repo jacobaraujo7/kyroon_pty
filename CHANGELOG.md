@@ -1,3 +1,15 @@
+## 1.0.4
+
+* **Inherit the full environment by default** — `Pty.start` now passes the whole
+  parent environment to the child instead of a small allow-list
+  (`PATH`/`HOME`/`USER`/…). On Windows the old behavior dropped
+  `SystemRoot`/`APPDATA`/`USERPROFILE`/`TEMP`, which made Node/Bun-based CLIs
+  (e.g. `claude`) fail to start silently — the terminal stayed blank even though
+  shells worked. `TERM`/`LANG` are still defaulted when the parent doesn't set
+  them, and anything passed via `environment:` still overrides. Callers that
+  already passed `Map.from(Platform.environment)` (like the example) are
+  unaffected.
+
 ## 1.0.3
 
 * **Fix blank Windows terminal (regression from 1.0.2)** — 1.0.2 dropped the

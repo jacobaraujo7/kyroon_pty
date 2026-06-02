@@ -58,29 +58,22 @@ class Pty {
 
     final effectiveEnv = <String, String>{};
 
-    effectiveEnv['TERM'] = 'xterm-256color';
-    // Without this, tools like "vi" produce sequences that are not UTF-8 friendly
-    effectiveEnv['LANG'] = 'en_US.UTF-8';
+    // Inherit the full parent environment, like a real terminal. This matters a
+    // lot on Windows: a minimal environment is missing SystemRoot / APPDATA /
+    // USERPROFILE / TEMP, and without those many CLIs — anything on the Node or
+    // Bun runtime, e.g. `claude` — fail to start silently and the terminal just
+    // stays blank. (Previously only a small allow-list was copied, which broke
+    // exactly these tools.) Callers can still add to or override any variable
+    // through the [environment] parameter below.
+    effectiveEnv.addAll(Platform.environment);
 
-    const envValuesToCopy = {
-      'LOGNAME',
-      'USER',
-      'DISPLAY',
-      'LC_TYPE',
-      'HOME',
-      'PATH'
-    };
-
-    for (var entry in Platform.environment.entries) {
-      if (envValuesToCopy.contains(entry.key)) {
-        effectiveEnv[entry.key] = entry.value;
-      }
-    }
+    // Terminal defaults, only when the parent didn't already provide them.
+    effectiveEnv.putIfAbsent('TERM', () => 'xterm-256color');
+    // Without this, tools like "vi" produce sequences that are not UTF-8 friendly.
+    effectiveEnv.putIfAbsent('LANG', () => 'en_US.UTF-8');
 
     if (environment != null) {
-      for (var entry in environment.entries) {
-        effectiveEnv[entry.key] = entry.value;
-      }
+      effectiveEnv.addAll(environment);
     }
 
     // build argv
