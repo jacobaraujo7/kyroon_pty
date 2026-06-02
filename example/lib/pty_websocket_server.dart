@@ -52,9 +52,16 @@ class PtyWebSocketServer {
   int? _exitCode;
   final _clients = <WebSocket>{};
   final _snapshot = BytesBuilder(copy: false);
+  final _inputController = StreamController<Uint8List>.broadcast();
 
   bool get isRunning => _server != null;
   int get boundPort => _server?.port ?? port;
+
+  /// Fires on this host (the "origin system") every time a connected client
+  /// sends input (stdin) — i.e. someone typed/pasted into the terminal from a
+  /// remote viewer. Use it for activity tracking, audit logging, idle timeouts
+  /// or to wake the host UI. Emits the raw bytes that were written to the PTY.
+  Stream<Uint8List> get onInput => _inputController.stream;
 
   Future<void> start() async {
     if (_server != null) return;
@@ -117,7 +124,10 @@ class PtyWebSocketServer {
     ws.listen(
       (message) {
         if (message is List<int>) {
-          _pty?.write(Uint8List.fromList(message)); // stdin
+          final bytes = Uint8List.fromList(message);
+          _pty?.write(bytes); // stdin
+          // Notify the origin system that a client interacted with the input.
+          if (!_inputController.isClosed) _inputController.add(bytes);
         } else if (message is String) {
           _onControl(message);
         }
@@ -161,5 +171,6 @@ class PtyWebSocketServer {
     await _server?.close(force: true);
     _server = null;
     _pty = null;
+    await _inputController.close();
   }
 }

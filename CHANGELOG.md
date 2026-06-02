@@ -1,3 +1,43 @@
+## 1.0.1
+
+Example app improvements (the plugin API in `lib/` is unchanged):
+
+* **Input events** — `PtySession.onInput` (`Stream<String>`) fires when input is
+  sent to the process. Live typing is buffered and emitted once per committed
+  line (on Enter); the command bar emits the whole command at once. Useful for
+  activity tracking, audit logs or idle-timer resets.
+
+  ```dart
+  session.onInput.listen((line) => print('input: $line'));
+  ```
+
+* **CLI idle detection** — `PtySession.onIdle` (`Stream<TerminalIdleEvent>`)
+  fires when the process stops producing output after a burst of activity — a
+  heuristic for "the CLI (claude/codex/qwen/…) finished and is idle". Tunable
+  via `session.idleThreshold` (default 1.5s) and an optional
+  `session.idleReadyPattern` (a `RegExp` matched against recent output so a long
+  *silent* task doesn't look idle until its prompt returns). A reactive
+  `session.busy` drives the RUNNING/IDLE status badge.
+
+  ```dart
+  session.idleThreshold = const Duration(milliseconds: 1200);
+  session.idleReadyPattern = RegExp(r'\$ $'); // fire only when the prompt is back
+  session.onIdle.listen((e) => print('idle after ${e.busyFor.inMilliseconds}ms'));
+  ```
+
+* **Accented input in the terminal** — dead-key composition (´ ` ^ ~ ¨ + letter →
+  á ã ê ç ü …) for typing directly into the PTY on desktop, where the IME path
+  is unavailable on Windows.
+
+* **Ctrl+Enter / Shift+Enter** — send a newline (LF) instead of submitting (CR),
+  matching how CLIs like Claude/readline insert a line break.
+
+* **Command bar ⇄ direct-PTY toggle** — switch between typing through the input
+  bar and typing straight into the terminal.
+
+* **WebSocket host input event** — `PtyWebSocketServer.onInput`
+  (`Stream<Uint8List>`) notifies the host when a remote client sends input.
+
 ## 1.0.0
 
 * First stable release of `kyroon_pty`.

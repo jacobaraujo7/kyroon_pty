@@ -34,8 +34,12 @@ class PtySession {
     backend = backendBuilder(terminal.viewWidth, terminal.viewHeight);
 
     // Backend output → emulator. The backend already decoded UTF-8 (streaming).
+    // Each chunk also feeds the idle detector (output activity = "busy").
     _outputSub = backend.output.listen((data) {
-      if (!_disposed) terminal.write(data);
+      if (_disposed) return;
+      terminal.write(data);
+      if (idleReadyPattern != null) _appendTail(data);
+      _markBusy();
     });
 
     backend.done.then((_) {
@@ -45,12 +49,19 @@ class PtySession {
       terminal.write(
         '\r\n\x1b[90m── process exited${code != null ? ' (code $code)' : ''} ──\x1b[0m\r\n',
       );
+      _idleTimer?.cancel();
+      busy.value = false;
       exited.value = true;
     });
 
     // Keyboard / paste → backend (local PTY stdin, or remote SendPtyInput).
+    // Bytes always go to the PTY immediately (live echo), but the onInput
+    // *event* is buffered and only fires once a line is committed (Enter) —
+    // otherwise live typing emits one event per keystroke.
     terminal.onOutput = (data) {
-      if (!_disposed) backend.write(data);
+      if (_disposed) return;
+      backend.write(data);
+      _bufferLiveInput(data);
     };
 
     // View size → backend (local resize, or remote ResizePty).
@@ -149,6 +160,112 @@ class PtySession {
   /// True once the underlying process / stream has ended.
   final exited = ValueNotifier<bool>(false);
 
+  /// Reactive processing state: true while the process is producing output
+  /// (the CLI is working), false once it goes idle (see [onIdle]). Bind a badge
+  /// to this to show RUNNING vs IDLE.
+  final busy = ValueNotifier<bool>(false);
+
+  /// Fires every time input is sent to the process — live typing, pasted text,
+  /// the command bar, or a programmatic [sendText]/[sendCommand]. Lets the
+  /// embedder / origin system react to user interaction (activity tracking,
+  /// idle-timer reset, audit, analytics…) without intercepting the byte stream.
+  Stream<String> get onInput => _inputController.stream;
+  final _inputController = StreamController<String>.broadcast();
+
+  /// Accumulates live keystrokes until a line is committed (Enter), so onInput
+  /// fires once per line instead of once per character.
+  final _inputLine = StringBuffer();
+
+  void _emitInput(String data) {
+    if (!_disposed && data.isNotEmpty && !_inputController.isClosed) {
+      _inputController.add(data);
+    }
+  }
+
+  /// Buffers live typing and only emits an input event when an Enter (CR/LF) is
+  /// seen — the whole committed line is emitted at once.
+  void _bufferLiveInput(String data) {
+    _inputLine.write(data);
+    if (data.contains('\r') || data.contains('\n')) {
+      final line = _inputLine.toString();
+      _inputLine.clear();
+      _emitInput(line);
+    }
+  }
+
+  /// Fires when the process goes quiet after a burst of output — a heuristic for
+  /// "the CLI (claude/codex/qwen/…) finished processing and is now idle". One
+  /// event per processing→idle transition; it re-arms on the next output.
+  ///
+  /// Detection is by output quiescence: no new output for [idleThreshold] after
+  /// activity. This works well for agentic CLIs because they render an animated
+  /// spinner / status line while working ("✻ Thinking… (12s)"), which keeps
+  /// output flowing the whole time a task runs — so a long, heavy task does NOT
+  /// look idle. The only way to get a false "idle" is a CLI that produces *no*
+  /// output at all for longer than [idleThreshold] while still working; raise
+  /// the threshold to cover that. (No fixed time can cover an arbitrarily long
+  /// fully-silent task — for that you'd gate on a prompt/ready pattern instead.)
+  Stream<TerminalIdleEvent> get onIdle => _idleController.stream;
+  final _idleController = StreamController<TerminalIdleEvent>.broadcast();
+
+  /// How long output must stay quiet (after activity) before the session is
+  /// considered idle. Default is generous (1.5s) to avoid flagging idle during
+  /// momentary pauses in a long task; lower it for snappier detection, raise it
+  /// for CLIs that go silent mid-task.
+  Duration idleThreshold = const Duration(milliseconds: 1500);
+
+  /// Optional precision gate for [onIdle]. When set, idle only fires if the
+  /// recent output (ANSI-stripped) matches this pattern — i.e. the CLI's
+  /// prompt/ready indicator is actually on screen. This avoids false "idle"
+  /// during a long task that goes silent without finishing: if the prompt
+  /// hasn't reappeared, no event is emitted no matter how long the silence.
+  /// Leave null for pure output-quiescence detection (the default).
+  ///
+  /// Examples: `RegExp(r'\$ $')` (shell), or a CLI's input box marker.
+  RegExp? idleReadyPattern;
+
+  Timer? _idleTimer;
+  DateTime? _busySince;
+  final _outTail = StringBuffer();
+
+  static final _ansiEscape = RegExp(
+    r'\x1B\[[0-9;?]*[ -/]*[@-~]|\x1B\][^\x07\x1B]*(?:\x07|\x1B\\)',
+  );
+
+  void _appendTail(String data) {
+    _outTail.write(data);
+    if (_outTail.length > 600) {
+      final s = _outTail.toString();
+      _outTail
+        ..clear()
+        ..write(s.substring(s.length - 400));
+    }
+  }
+
+  void _markBusy() {
+    _busySince ??= DateTime.now();
+    busy.value = true;
+    _idleTimer?.cancel();
+    _idleTimer = Timer(idleThreshold, _markIdle);
+  }
+
+  void _markIdle() {
+    if (_disposed || _busySince == null) return;
+    // Precision gate: if a ready pattern is configured but the prompt isn't on
+    // screen yet, the CLI is still working (just silent) — don't flag idle.
+    final pattern = idleReadyPattern;
+    if (pattern != null &&
+        !pattern.hasMatch(_outTail.toString().replaceAll(_ansiEscape, ''))) {
+      return;
+    }
+    final busyFor = DateTime.now().difference(_busySince!);
+    _busySince = null;
+    busy.value = false;
+    if (!_idleController.isClosed) {
+      _idleController.add(TerminalIdleEvent(DateTime.now(), busyFor));
+    }
+  }
+
   int? get exitCode => backend.exitCode;
 
   int get pid => backend.pid ?? -1;
@@ -163,6 +280,18 @@ class PtySession {
   void sendText(String text) {
     if (_disposed) return;
     backend.write(text);
+    _emitInput(text);
+  }
+
+  /// Writes keyboard-origin bytes to the process through the same path as live
+  /// typing (immediate write + per-line [onInput] buffering). Used by the view
+  /// for dead-key/accent composition, so composed characters are echoed by the
+  /// PTY and counted toward the committed-line input event — not emitted per
+  /// keystroke.
+  void sendKeyboard(String data) {
+    if (_disposed || data.isEmpty) return;
+    backend.write(data);
+    _bufferLiveInput(data);
   }
 
   /// Types a full command line and presses Enter, so it runs on the machine
@@ -170,7 +299,9 @@ class PtySession {
   /// transport). `\r` is the Enter key as the line discipline expects it.
   void sendCommand(String command) {
     if (_disposed) return;
-    backend.write('$command\r');
+    final data = '$command\r';
+    backend.write(data);
+    _emitInput(data);
   }
 
   /// Frees everything this session owns. Idempotent. Call only after the
@@ -180,12 +311,28 @@ class PtySession {
     if (_disposed) return;
     _disposed = true;
     _outputSub?.cancel();
+    _idleTimer?.cancel();
+    _inputController.close();
+    _idleController.close();
     backend.dispose();
     scrollController.dispose();
     terminalController.dispose();
     titleNotifier.dispose();
     exited.dispose();
+    busy.dispose();
   }
+}
+
+/// Emitted by [PtySession.onIdle] when the process stops producing output after
+/// a burst of activity — a heuristic for "the CLI finished and is now idle".
+class TerminalIdleEvent {
+  const TerminalIdleEvent(this.at, this.busyFor);
+
+  /// When the session went idle.
+  final DateTime at;
+
+  /// How long output had been flowing before it went quiet.
+  final Duration busyFor;
 }
 
 TerminalTargetPlatform get _terminalPlatform {

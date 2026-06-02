@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -48,6 +49,11 @@ class _HostPageState extends State<HostPage> {
   String _status = 'parado';
   String _url = '';
 
+  // Origin-system view of remote input: counts every interaction a client sends.
+  StreamSubscription<List<int>>? _inputSub;
+  int _inputEvents = 0;
+  int _inputBytes = 0;
+
   @override
   void initState() {
     super.initState();
@@ -57,6 +63,7 @@ class _HostPageState extends State<HostPage> {
 
   @override
   void dispose() {
+    _inputSub?.cancel();
     _server?.stop();
     super.dispose();
   }
@@ -68,6 +75,14 @@ class _HostPageState extends State<HostPage> {
       port: 8080,
     );
     await server.start();
+    // The origin system gets an event whenever a remote client sends input.
+    _inputSub = server.onInput.listen((data) {
+      if (!mounted) return;
+      setState(() {
+        _inputEvents++;
+        _inputBytes += data.length;
+      });
+    });
     if (!mounted) return;
     setState(() {
       _server = server;
@@ -77,6 +92,8 @@ class _HostPageState extends State<HostPage> {
   }
 
   Future<void> _stop() async {
+    await _inputSub?.cancel();
+    _inputSub = null;
     await _server?.stop();
     if (!mounted) return;
     setState(() {
@@ -110,6 +127,13 @@ class _HostPageState extends State<HostPage> {
               'status: $_status',
               style: const TextStyle(color: AppColors.fgMuted, fontSize: 12),
             ),
+            if (running) ...[
+              const SizedBox(height: 6),
+              Text(
+                'eventos de input recebidos: $_inputEvents  ·  $_inputBytes bytes',
+                style: const TextStyle(color: AppColors.fgMuted, fontSize: 12),
+              ),
+            ],
             const SizedBox(height: 24),
             running
                 ? FilledButton.icon(

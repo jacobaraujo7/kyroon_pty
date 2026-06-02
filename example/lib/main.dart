@@ -1,7 +1,9 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:xterm/xterm.dart';
 
 import 'pty_session.dart';
@@ -46,6 +48,10 @@ class _TerminalWorkspaceState extends State<TerminalWorkspace> {
   final List<PtySession> _sessions = [];
   int _activeIndex = 0;
   int _nextId = 1;
+
+  /// Whether the command-input bar is shown. When off, input goes straight to
+  /// the PTY (type in the terminal itself). Toggled from the meta bar.
+  bool _showCommandBar = true;
 
   @override
   void initState() {
@@ -125,7 +131,13 @@ class _TerminalWorkspaceState extends State<TerminalWorkspace> {
               onNew: _newSession,
               onNewClaude: _newClaudeSession,
             ),
-            if (_active != null) _MetaBar(session: _active!),
+            if (_active != null)
+              _MetaBar(
+                session: _active!,
+                showCommandBar: _showCommandBar,
+                onToggleCommandBar: () =>
+                    setState(() => _showCommandBar = !_showCommandBar),
+              ),
             Expanded(
               child: Padding(
                 padding: const EdgeInsets.all(10),
@@ -137,7 +149,11 @@ class _TerminalWorkspaceState extends State<TerminalWorkspace> {
                         index: _activeIndex,
                         children: [
                           for (final s in _sessions)
-                            TerminalPane(key: ValueKey(s.id), session: s),
+                            TerminalPane(
+                              key: ValueKey(s.id),
+                              session: s,
+                              showCommandBar: _showCommandBar,
+                            ),
                         ],
                       ),
               ),
@@ -318,6 +334,48 @@ class _TabBar extends StatelessWidget {
 /// Android brand green — distinguishes the "open Claude" action from "+".
 const _kAndroidGreen = Color(0xFF3DDC84);
 
+// ── Dead-key (accent) composition ───────────────────────────────────────────
+// The IME path that would compose accents natively crashes on Windows desktop
+// ("view ID is null"), so with hardware-key input we compose dead keys here:
+// hold the accent, then combine it with the next letter. ABNT2/Latin layouts.
+const _kDeadKeys = {'´', '`', '^', '~', '¨'};
+
+const _kCompose = <String, Map<String, String>>{
+  '´': {'a': 'á', 'e': 'é', 'i': 'í', 'o': 'ó', 'u': 'ú', 'y': 'ý', 'c': 'ć', 'n': 'ń'},
+  '`': {'a': 'à', 'e': 'è', 'i': 'ì', 'o': 'ò', 'u': 'ù'},
+  '^': {'a': 'â', 'e': 'ê', 'i': 'î', 'o': 'ô', 'u': 'û'},
+  '~': {'a': 'ã', 'o': 'õ', 'n': 'ñ'},
+  '¨': {'a': 'ä', 'e': 'ë', 'i': 'ï', 'o': 'ö', 'u': 'ü', 'y': 'ÿ'},
+};
+
+/// Composes a pending dead-key accent with the next typed character.
+/// - base vowel/consonant → the accented letter (á, ã, ê…), preserving case;
+/// - an already-composed accented letter (the OS pre-composed it) → as-is;
+/// - space → the literal spacing accent (dead-key + space convention);
+/// - anything else (e.g. `~/`, `` `cmd` ``) → accent followed by the char.
+String composeDeadKey(String dead, String ch) {
+  if (ch == ' ') return dead;
+  final lower = ch.toLowerCase();
+  final composed = _kCompose[dead]?[lower];
+  if (composed != null) return ch == lower ? composed : composed.toUpperCase();
+  // Already an accented (non-ASCII) letter → the OS composed it; keep it.
+  if (ch.runes.isNotEmpty && ch.runes.first > 0x7f && !_kDeadKeys.contains(ch)) {
+    return ch;
+  }
+  return '$dead$ch'; // didn't combine — emit accent + char literally
+}
+
+final _kModifierKeys = <LogicalKeyboardKey>{
+  LogicalKeyboardKey.shiftLeft,
+  LogicalKeyboardKey.shiftRight,
+  LogicalKeyboardKey.controlLeft,
+  LogicalKeyboardKey.controlRight,
+  LogicalKeyboardKey.altLeft,
+  LogicalKeyboardKey.altRight,
+  LogicalKeyboardKey.metaLeft,
+  LogicalKeyboardKey.metaRight,
+};
+
 class _Tab extends StatelessWidget {
   const _Tab({
     required this.session,
@@ -476,10 +534,103 @@ class _RoundIconButtonState extends State<_RoundIconButton> {
   }
 }
 
-// ── Meta bar (cli · path · pid) ─────────────────────────────────────────────
-class _MetaBar extends StatelessWidget {
-  const _MetaBar({required this.session});
+// ── Meta bar (cli · path · last-input · pid) ────────────────────────────────
+class _MetaBar extends StatefulWidget {
+  const _MetaBar({
+    required this.session,
+    required this.showCommandBar,
+    required this.onToggleCommandBar,
+  });
   final PtySession session;
+  final bool showCommandBar;
+  final VoidCallback onToggleCommandBar;
+
+  @override
+  State<_MetaBar> createState() => _MetaBarState();
+}
+
+class _MetaBarState extends State<_MetaBar> {
+  // Live view of PtySession.onInput — proves the input event reaches the origin
+  // system. Updated on every keystroke/paste/command sent to the PTY.
+  StreamSubscription<String>? _inputSub;
+  DateTime? _lastInputAt;
+  String _lastInputPreview = '';
+
+  // Live view of PtySession.onIdle — fires when the CLI finishes processing.
+  StreamSubscription<TerminalIdleEvent>? _idleSub;
+  DateTime? _lastIdleAt;
+  Duration? _lastBusyFor;
+
+  @override
+  void initState() {
+    super.initState();
+    _subscribe();
+  }
+
+  @override
+  void didUpdateWidget(_MetaBar oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.session != widget.session) {
+      _lastInputAt = null;
+      _lastInputPreview = '';
+      _lastIdleAt = null;
+      _lastBusyFor = null;
+      _subscribe();
+    }
+  }
+
+  void _subscribe() {
+    _inputSub?.cancel();
+    _idleSub?.cancel();
+    _inputSub = widget.session.onInput.listen((data) {
+      if (!mounted) return;
+      setState(() {
+        _lastInputAt = DateTime.now();
+        _lastInputPreview = _sanitizePreview(data);
+      });
+    });
+    _idleSub = widget.session.onIdle.listen((event) {
+      if (!mounted) return;
+      setState(() {
+        _lastIdleAt = event.at;
+        _lastBusyFor = event.busyFor;
+      });
+    });
+  }
+
+  @override
+  void dispose() {
+    _inputSub?.cancel();
+    _idleSub?.cancel();
+    super.dispose();
+  }
+
+  /// Turns raw input bytes (which may carry CR/LF/control chars) into a short,
+  /// printable preview suitable for a status label.
+  static String _sanitizePreview(String s) {
+    final buf = StringBuffer();
+    for (final r in s.runes) {
+      if (r == 0x0d || r == 0x0a) {
+        buf.write('⏎');
+      } else if (r == 0x09) {
+        buf.write('⇥');
+      } else if (r < 0x20 || r == 0x7f) {
+        buf.write('·');
+      } else {
+        buf.writeCharCode(r);
+      }
+    }
+    var out = buf.toString();
+    if (out.length > 24) out = '…${out.substring(out.length - 24)}';
+    return out;
+  }
+
+  static String _fmtTime(DateTime t) =>
+      '${t.hour.toString().padLeft(2, '0')}:'
+      '${t.minute.toString().padLeft(2, '0')}:'
+      '${t.second.toString().padLeft(2, '0')}';
+
+  PtySession get session => widget.session;
 
   @override
   Widget build(BuildContext context) {
@@ -509,6 +660,8 @@ class _MetaBar extends StatelessWidget {
               ),
             ),
           ),
+          const SizedBox(width: 8),
+          _StatusBadge(session: session),
           const SizedBox(width: 10),
           Flexible(
             child: Text(
@@ -524,6 +677,15 @@ class _MetaBar extends StatelessWidget {
             ),
           ),
           const Spacer(),
+          _CommandBarToggle(
+            on: widget.showCommandBar,
+            onTap: widget.onToggleCommandBar,
+          ),
+          const SizedBox(width: 12),
+          _LastInputLabel(at: _lastInputAt, preview: _lastInputPreview),
+          const SizedBox(width: 12),
+          _IdleLabel(at: _lastIdleAt, busyFor: _lastBusyFor),
+          const SizedBox(width: 12),
           Text(
             session.exited.value
                 ? 'exited ${session.exitCode}'
@@ -541,10 +703,223 @@ class _MetaBar extends StatelessWidget {
   }
 }
 
+/// Status label fed by `PtySession.onInput`: shows the time of the last
+/// interaction and a short preview of what was typed/sent — a live, visible
+/// proof that the input event fires for both direct typing and the command bar.
+class _LastInputLabel extends StatelessWidget {
+  const _LastInputLabel({required this.at, required this.preview});
+  final DateTime? at;
+  final String preview;
+
+  @override
+  Widget build(BuildContext context) {
+    final hasInput = at != null;
+    final label = hasInput
+        ? '${_MetaBarState._fmtTime(at!)}  ${preview.isEmpty ? '' : '› $preview'}'
+        : 'sem interação';
+    return Tooltip(
+      message: 'Última interação (PtySession.onInput) — hora e texto enviado',
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            Icons.bolt_rounded,
+            size: 13,
+            color: hasInput ? AppColors.accent : AppColors.fgMuted,
+          ),
+          const SizedBox(width: 4),
+          ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 220),
+            child: Text(
+              label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: hasInput ? AppColors.fgDim : AppColors.fgMuted,
+                fontSize: 10,
+                fontFamily: kMonoFontFamily,
+                fontFamilyFallback: kMonoFontFallback,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Amber used for the RUNNING (processing) state.
+const _kRunningAmber = Color(0xFFF59E0B);
+
+/// Live RUNNING / IDLE / ENCERRADO badge, driven by `PtySession.busy` and
+/// `PtySession.exited`. RUNNING while the CLI produces output, IDLE once it goes
+/// quiet (finished), ENCERRADO when the process ends.
+class _StatusBadge extends StatelessWidget {
+  const _StatusBadge({required this.session});
+  final PtySession session;
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: Listenable.merge([session.busy, session.exited]),
+      builder: (context, _) {
+        final String label;
+        final Color color;
+        final IconData icon;
+        if (session.exited.value) {
+          label = 'ENCERRADO';
+          color = AppColors.fgMuted;
+          icon = Icons.stop_circle_outlined;
+        } else if (session.busy.value) {
+          label = 'RUNNING';
+          color = _kRunningAmber;
+          icon = Icons.autorenew_rounded;
+        } else {
+          label = 'IDLE';
+          color = AppColors.success;
+          icon = Icons.check_circle_outline_rounded;
+        }
+        return Container(
+          padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 3),
+          decoration: BoxDecoration(
+            color: color.withValues(alpha: 0.14),
+            borderRadius: BorderRadius.circular(AppRadius.full),
+            border: Border.all(color: color.withValues(alpha: 0.7)),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(icon, size: 12, color: color),
+              const SizedBox(width: 5),
+              Text(
+                label,
+                style: TextStyle(
+                  color: color,
+                  fontSize: 10,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 0.7,
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+/// Status label fed by `PtySession.onIdle`: shows when the CLI last finished
+/// processing (went idle) and for how long it had been busy.
+class _IdleLabel extends StatelessWidget {
+  const _IdleLabel({required this.at, required this.busyFor});
+  final DateTime? at;
+  final Duration? busyFor;
+
+  @override
+  Widget build(BuildContext context) {
+    final idle = at != null;
+    final secs = busyFor == null
+        ? ''
+        : ' (${(busyFor!.inMilliseconds / 1000).toStringAsFixed(1)}s)';
+    final label = idle ? '${_MetaBarState._fmtTime(at!)}$secs' : 'aguardando';
+    return Tooltip(
+      message: 'Última vez que o CLI ficou ocioso (PtySession.onIdle) — '
+          'hora e quanto tempo processou',
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            Icons.bedtime_rounded,
+            size: 13,
+            color: idle ? _kAndroidGreen : AppColors.fgMuted,
+          ),
+          const SizedBox(width: 4),
+          Text(
+            label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: idle ? AppColors.fgDim : AppColors.fgMuted,
+              fontSize: 10,
+              fontFamily: kMonoFontFamily,
+              fontFamilyFallback: kMonoFontFallback,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Toggle between typing through the command-input bar and typing straight into
+/// the PTY. The pill reflects the current mode and flips it on tap.
+class _CommandBarToggle extends StatelessWidget {
+  const _CommandBarToggle({required this.on, required this.onTap});
+
+  /// True when the command bar is visible (input via the bar); false means
+  /// input goes directly to the terminal.
+  final bool on;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final accent = on ? AppColors.accent : _kAndroidGreen;
+    return Tooltip(
+      message: on
+          ? 'Barra de comando ATIVA — clique para digitar direto no PTY'
+          : 'Digitação direta no PTY — clique para usar a barra de comando',
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(AppRadius.full),
+          onTap: onTap,
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 120),
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+            decoration: BoxDecoration(
+              color: accent.withValues(alpha: 0.14),
+              borderRadius: BorderRadius.circular(AppRadius.full),
+              border: Border.all(color: accent),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  on ? Icons.keyboard_rounded : Icons.terminal_rounded,
+                  size: 14,
+                  color: accent,
+                ),
+                const SizedBox(width: 6),
+                Text(
+                  on ? 'BARRA DE INPUT' : 'PTY DIRETO',
+                  style: TextStyle(
+                    color: accent,
+                    fontSize: 10,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 0.6,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 // ── Terminal pane (the xterm view + jump-to-bottom) ─────────────────────────
 class TerminalPane extends StatefulWidget {
-  const TerminalPane({super.key, required this.session});
+  const TerminalPane({
+    super.key,
+    required this.session,
+    this.showCommandBar = true,
+  });
   final PtySession session;
+
+  /// When false, the command-input bar is hidden and the user types straight
+  /// into the PTY (the terminal keeps focus). Toggled from the meta bar.
+  final bool showCommandBar;
 
   @override
   State<TerminalPane> createState() => _TerminalPaneState();
@@ -553,15 +928,38 @@ class TerminalPane extends StatefulWidget {
 class _TerminalPaneState extends State<TerminalPane> {
   bool _atBottom = true;
 
+  // Owned focus node so we can move keyboard focus into the terminal when the
+  // command bar is hidden (otherwise focus stays where the bar was and the PTY
+  // receives nothing).
+  final FocusNode _termFocus = FocusNode();
+
   @override
   void initState() {
     super.initState();
     widget.session.scrollController.addListener(_onScroll);
+    if (!widget.showCommandBar) _focusTerminal();
+  }
+
+  @override
+  void didUpdateWidget(TerminalPane oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // Switched into "type directly into the PTY" mode → focus the terminal.
+    if (oldWidget.showCommandBar && !widget.showCommandBar) {
+      _focusTerminal();
+    }
+  }
+
+  /// Moves keyboard focus to the terminal so hardware keys reach the PTY.
+  void _focusTerminal() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _termFocus.requestFocus();
+    });
   }
 
   @override
   void dispose() {
     widget.session.scrollController.removeListener(_onScroll);
+    _termFocus.dispose();
     super.dispose();
   }
 
@@ -570,6 +968,60 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (!c.hasClients) return;
     final atBottom = c.offset >= c.position.maxScrollExtent - 4;
     if (atBottom != _atBottom) setState(() => _atBottom = atBottom);
+  }
+
+  /// Pending dead-key accent (´ ` ^ ~ ¨) awaiting the next character.
+  String? _deadKey;
+
+  /// Handles two things the raw terminal doesn't on desktop:
+  ///  * **dead-key accents** — composes ´/`/^/~/¨ with the next letter (é, ã…)
+  ///    since the IME path that would do this crashes on Windows desktop;
+  ///  * **Ctrl+Enter / Shift+Enter** — sends a newline (LF) instead of the
+  ///    carriage return that plain Enter produces.
+  /// Returns `handled` when it consumed the key; otherwise `ignored` so xterm
+  /// processes it normally.
+  KeyEventResult _handleTerminalKey(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+      return KeyEventResult.ignored;
+    }
+    // Never let a modifier press disturb a pending accent (e.g. ´ then Shift+a
+    // for Á): modifiers arrive as their own char-less events.
+    if (_kModifierKeys.contains(event.logicalKey)) {
+      return KeyEventResult.ignored;
+    }
+
+    final isEnter = event.logicalKey == LogicalKeyboardKey.enter ||
+        event.logicalKey == LogicalKeyboardKey.numpadEnter;
+    final ch = event.character;
+
+    // Resolve a pending dead key against this keystroke.
+    if (_deadKey != null) {
+      final dead = _deadKey!;
+      _deadKey = null;
+      if (ch != null && ch.isNotEmpty && !isEnter) {
+        widget.session.sendKeyboard(composeDeadKey(dead, ch));
+        return KeyEventResult.handled;
+      }
+      // Non-character key (arrows/Enter/…): flush the accent literally, then
+      // let the key continue through normal handling below.
+      widget.session.sendKeyboard(dead);
+    }
+
+    // Ctrl/Shift+Enter → newline (LF) instead of submit (CR).
+    if (isEnter &&
+        (HardwareKeyboard.instance.isControlPressed ||
+            HardwareKeyboard.instance.isShiftPressed)) {
+      widget.session.sendText('\n');
+      return KeyEventResult.handled;
+    }
+
+    // Start composing when an accent dead key is pressed; wait for the next key.
+    if (ch != null && ch.length == 1 && _kDeadKeys.contains(ch)) {
+      _deadKey = ch;
+      return KeyEventResult.handled;
+    }
+
+    return KeyEventResult.ignored;
   }
 
   void _jumpToBottom() {
@@ -587,13 +1039,16 @@ class _TerminalPaneState extends State<TerminalPane> {
     return Column(
       children: [
         Expanded(child: _buildTerminal()),
-        const SizedBox(height: 8),
         // "Type something and send it to the machine running the PTY." For a
         // remote backend this is how a phone drives a shell on another box.
-        _CommandBar(
-          onSend: widget.session.sendCommand,
-          inputEnabled: widget.session.inputEnabled,
-        ),
+        // Hidden when the user opts to type directly into the PTY.
+        if (widget.showCommandBar) ...[
+          const SizedBox(height: 8),
+          _CommandBar(
+            onSend: widget.session.sendCommand,
+            inputEnabled: widget.session.inputEnabled,
+          ),
+        ],
       ],
     );
   }
@@ -617,6 +1072,7 @@ class _TerminalPaneState extends State<TerminalPane> {
                 valueListenable: widget.session.backend.inputEnabled,
                 builder: (context, canInput, _) => TerminalView(
                   widget.session.terminal,
+                  focusNode: _termFocus,
                   controller: widget.session.terminalController,
                   scrollController: widget.session.scrollController,
                   theme: kTerminalTheme,
@@ -630,11 +1086,18 @@ class _TerminalPaneState extends State<TerminalPane> {
                   backgroundOpacity: 0,
                   cursorType: TerminalCursorType.block,
                   readOnly: !canInput,
-                  // Desktop: read characters straight from hardware key events
-                  // (event.character) instead of the platform IME/text-input
-                  // connection — robust typing without an on-screen keyboard.
-                  // On mobile you'd flip this to false so the soft keyboard works.
+                  // Read characters straight from hardware key events. The IME /
+                  // text-input path (hardwareKeyboardOnly:false) composes dead
+                  // keys (accents) correctly, but on Windows desktop it throws
+                  // "Could not set client, view ID is null" on attach and typing
+                  // fails — so we keep hardware mode here for reliable input.
+                  // For accented text use the command bar (a normal TextField,
+                  // which handles dead keys via the OS IME).
                   hardwareKeyboardOnly: true,
+                  // Highest-priority key hook: turn Ctrl+Enter / Shift+Enter into
+                  // a literal newline (LF) instead of "submit" (CR). Apps like
+                  // the Claude CLI / readline treat LF as "insert line break".
+                  onKeyEvent: _handleTerminalKey,
                 ),
               ),
             ),
