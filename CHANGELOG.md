@@ -1,3 +1,17 @@
+## 1.0.5
+
+* **Fix PTY spawn failure on Windows ARM64** — `build_working_directory` copied
+  the path with `block[i] = src[i++]`, which reads and modifies `i` with no
+  sequence point between the two uses (undefined behavior). MSVC's ARM64 backend
+  can evaluate it differently than x64/clang and corrupt the working-directory
+  string, so `CreateProcessW` failed with "Failed to create process" whenever a
+  `workingDirectory` was passed. The increment is now its own statement, matching
+  `build_command`/`build_environment`. Callers that pass no `workingDirectory`
+  were never affected.
+* **Surface the real Win32 error** — on a `CreateProcessW` failure the error now
+  includes `GetLastError` plus the executable and working directory, so the cause
+  reaches the Dart exception instead of a `printf` the GUI swallows.
+
 ## 1.0.4
 
 * **Inherit the full environment by default** — `Pty.start` now passes the whole

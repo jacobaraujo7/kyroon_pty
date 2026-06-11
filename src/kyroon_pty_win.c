@@ -141,7 +141,13 @@ static LPWSTR build_working_directory(char *working_directory)
 
     while (working_directory[i] != 0)
     {
-        working_directory_block[i] = (WCHAR)working_directory[i++];
+        // NB: keep the index increment in its own statement. Writing
+        // `block[i] = src[i++]` reads and modifies `i` with no sequence point
+        // between the two uses — undefined behavior. MSVC's ARM64 backend
+        // evaluates it differently than x64/clang, corrupting the path so
+        // CreateProcessW fails ("Failed to create process") on Windows ARM.
+        working_directory_block[i] = (WCHAR)working_directory[i];
+        i++;
     }
 
     working_directory_block[i] = 0;
@@ -282,6 +288,11 @@ typedef struct PtyHandle
 
 char *error_message = NULL;
 
+// Backing storage for formatted error messages (e.g. CreateProcessW's
+// GetLastError code). pty_error() returns this so the exact Win32 failure
+// surfaces in the Dart exception instead of only a printf the GUI swallows.
+static char error_buf[512];
+
 FFI_PLUGIN_EXPORT PtyHandle *pty_create(PtyOptions *options)
 {
     HANDLE inputReadSide = NULL;
@@ -403,9 +414,13 @@ FFI_PLUGIN_EXPORT PtyHandle *pty_create(PtyOptions *options)
 
     if (!ok)
     {
-        error_message = "Failed to create process";
         DWORD error = GetLastError();
-        printf("error no: %d\n", error);
+        snprintf(error_buf, sizeof(error_buf),
+                 "CreateProcessW failed: GetLastError=%lu (exe=\"%s\", cwd=\"%s\")",
+                 error,
+                 options->executable != NULL ? options->executable : "(null)",
+                 options->working_directory != NULL ? options->working_directory : "(null)");
+        error_message = error_buf;
         return NULL;
     }
 
