@@ -1,6 +1,6 @@
 name: kyroon_pty
 description: Native pseudo-terminal (PTY) for Flutter — spawn shells and processes with full ANSI, resize and job control. Backed by ConPTY/forkpty and ready to pair with xterm.
-version: 1.0.5
+version: 1.0.6
 homepage: https://github.com/cesarmod2017/kyroon_pty
 
 environment:
