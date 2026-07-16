@@ -7,21 +7,55 @@
 #include "include/dart_api_dl.h"
 #include "include/dart_native_api.h"
 
+// Monta a lpCommandLine do CreateProcessW.
+//
+// NB: NÃO prefixe o `executable` aqui. Chamamos o CreateProcessW com
+// `lpApplicationName == NULL`, então o Windows tira o nome do programa da
+// própria command line — ela tem que ser exatamente `argv[0] argv[1] ...`. E o
+// `arguments[0]` JÁ é o executável: o lado Dart preenche argv[0] com ele,
+// seguindo a convenção do execv (POSIX), que o caminho Unix deste mesmo pacote
+// usa.
+//
+// Escrever o `executable` aqui também duplicava o nome em TODA command line
+// (`pwsh.exe pwsh.exe`). Passou despercebido porque os shells comuns são
+// tolerantes — o `powershell.exe` trata o token extra como comando e abre um
+// shell aninhado, o `cmd.exe` descarta —, mas o `pwsh.exe` (PowerShell 7) tem
+// parser estrito e recusa ("The argument 'pwsh.exe' is not recognized"), e um
+// `wsl.exe -d <distro>` viraria `wsl.exe wsl.exe -d <distro>`, rodando a distro
+// errada.
 static LPWSTR build_command(char *executable, char **arguments)
 {
-    int command_length = 0;
-
-    if (executable != NULL)
+    // Sem argv utilizável: cai no executável sozinho, senão a command line sairia
+    // vazia e o CreateProcessW falharia.
+    if (arguments == NULL || arguments[0] == NULL)
     {
-        command_length += (int)strlen(executable);
+        if (executable == NULL)
+        {
+            return NULL;
+        }
+
+        int length = (int)strlen(executable);
+        LPWSTR command = malloc((length + 1) * sizeof(WCHAR));
+
+        if (command != NULL)
+        {
+            for (int j = 0; j <= length; j++)
+            {
+                command[j] = (WCHAR)executable[j];
+            }
+        }
+
+        return command;
     }
 
-    if (arguments != NULL)
+    int command_length = 0;
+
     {
         int i = 0;
 
         while (arguments[i] != NULL)
         {
+            // +1 pelo espaço separador (sobra um byte no 1º, que não leva).
             command_length += (int)strlen(arguments[i]) + 1;
             i++;
         }
@@ -32,38 +66,25 @@ static LPWSTR build_command(char *executable, char **arguments)
     if (command != NULL)
     {
         int i = 0;
+        int j = 0;
 
-        if (executable != NULL)
+        while (arguments[j] != NULL)
         {
-            int j = 0;
-
-            while (executable[j] != 0)
-            {
-                command[i] = (WCHAR)executable[j];
-                i++;
-                j++;
-            }
-        }
-
-        if (arguments != NULL)
-        {
-            int j = 0;
-
-            while (arguments[j] != NULL)
+            if (j > 0)
             {
                 command[i++] = ' ';
-
-                int k = 0;
-
-                while (arguments[j][k] != 0)
-                {
-                    command[i] = (WCHAR)arguments[j][k];
-                    i++;
-                    k++;
-                }
-
-                j++;
             }
+
+            int k = 0;
+
+            while (arguments[j][k] != 0)
+            {
+                command[i] = (WCHAR)arguments[j][k];
+                i++;
+                k++;
+            }
+
+            j++;
         }
 
         command[i] = 0;
